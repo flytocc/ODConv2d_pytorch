@@ -1,4 +1,5 @@
 import math
+import torch
 import torch.nn as nn
 
 
@@ -6,14 +7,15 @@ class ODConv2d(nn.Conv2d):
 
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, dilation=1, groups=1, bias=True,
-                 K=4, r=1 / 16,
+                 K=4, r=1 / 16, save_parameters=False,
                  padding_mode='zeros', device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         self.K = K
         self.r = r
-        super().__init__(in_channels, out_channels, kernel_size,
-                         stride, padding, dilation, groups, bias,
-                         padding_mode, device, dtype)
+        self.save_parameters = save_parameters
+
+        super().__init__(in_channels, out_channels, kernel_size, stride,
+                         padding, dilation, groups, bias, padding_mode)
 
         del self.weight
         self.weight = nn.Parameter(torch.empty((
@@ -33,11 +35,11 @@ class ODConv2d(nn.Conv2d):
         self.act = nn.ReLU(inplace=True)
 
         self.fc_f = nn.Linear(hidden_dim, out_channels)
-        if self.kernel_size[0] * self.kernel_size[1] > 1:
+        if not save_parameters or self.kernel_size[0] * self.kernel_size[1] > 1:
             self.fc_s = nn.Linear(hidden_dim, self.kernel_size[0] * self.kernel_size[1])
-        if in_channels // groups > 1:
+        if not save_parameters or in_channels // groups > 1:
             self.fc_c = nn.Linear(hidden_dim, in_channels // groups)
-        if K > 1:
+        if not save_parameters or K > 1:
             self.fc_w = nn.Linear(hidden_dim, K)
 
         self.reset_parameters()
@@ -50,44 +52,52 @@ class ODConv2d(nn.Conv2d):
             self.bias.data.zero_()
 
     def extra_repr(self):
-        return super().extra_repr() + f', K={self.K}, r={self.r}'
+        return super().extra_repr() + f', K={self.K}, r={self.r:.4}'
 
-    def attention(self, input):
-        B, C, H, W = input.shape
+    def get_weight_bias(self, context):
+        B, C, H, W = context.shape
 
-        x = self.gap(input).squeeze(-1).squeeze(-1)  # B, c_in
+        if C != self.in_channels:
+            raise ValueError(
+                f"Expected context{[B, C, H, W]} to have {self.in_channels} channels, but got {C} channels instead")
+
+        x = self.gap(context).squeeze(-1).squeeze(-1)  # B, c_in
         x = self.reduction(x)  # B, hidden_dim
         x = self.act(x)
 
         attn_f = self.fc_f(x).sigmoid()  # B, c_out
         attn = attn_f.view(B, 1, -1, 1, 1, 1)  # B, 1, c_out, 1, 1, 1
-        if self.kernel_size[0] * self.kernel_size[1] > 1:
+        if hasattr(self, 'fc_s'):
             attn_s = self.fc_s(x).sigmoid()  # B, k * k
             attn = attn * attn_s.view(B, 1, 1, 1, *self.kernel_size)  # B, 1, c_out, 1, k, k
-        if self.in_channels // self.groups > 1:
+        if hasattr(self, 'fc_c'):
             attn_c = self.fc_c(x).sigmoid()  # B, c_in // groups
             attn = attn * attn_c.view(B, 1, 1, -1, 1, 1)  # B, 1, c_out, c_in // groups, k, k
-        if self.K > 1:
+        if hasattr(self, 'fc_w'):
             attn_w = self.fc_w(x).softmax(-1)  # B, n
             attn = attn * attn_w.view(B, -1, 1, 1, 1, 1)  # B, n, c_out, c_in // groups, k, k
-
-        return attn, attn_w
-
-    def forward(self, input):
-        B, C, H, W = input.shape
-
-        if C != self.in_channels:
-            raise ValueError(
-                f"Expected input{[B, C, H, W]} to have {self.in_channels} channels, but got {C} channels instead")
-
-        attn, attn_w = self.attention(input)  # B, n, c_out, c_in // groups, k, k    # B, n
 
         weight = (attn * self.weight).sum(1)  # B, c_out, c_in // groups, k, k
         weight = weight.view(-1, self.in_channels // self.groups, *self.kernel_size)  # B * c_out, c_in // groups, k, k
 
         bias = None
         if self.bias is not None:
-            bias = (attn_w @ self.bias).view(-1)  # B * c_out
+            if hasattr(self, 'fc_w'):
+                bias = attn_w @ self.bias
+            else:
+                bias = self.bias.tile(B, 1)
+            bias = bias.view(-1)  # B * c_out
+
+        return weight, bias
+
+    def forward(self, input, context=None):
+        B, C, H, W = input.shape
+
+        if C != self.in_channels:
+            raise ValueError(
+                f"Expected input{[B, C, H, W]} to have {self.in_channels} channels, but got {C} channels instead")
+
+        weight, bias = self.get_weight_bias(context or input)
 
         output = nn.functional.conv2d(
             input.view(1, B * C, H, W), weight, bias,
@@ -96,7 +106,7 @@ class ODConv2d(nn.Conv2d):
 
         return output
 
-    def debug(self, input):
+    def debug(self, input, context=None):
         B, C, H, W = input.shape
 
         if C != self.in_channels:
@@ -108,9 +118,8 @@ class ODConv2d(nn.Conv2d):
             for i in range(2)
         ]
 
-        attn, attn_w = self.attention(input)  # B, n, c_out, c_in // groups, k, k    # B, n
+        weight, bias = self.get_weight_bias(context or input)
 
-        weight = (attn * self.weight).sum(1)  # B, c_out, c_in // groups, k, k
         weight = weight.view(B, self.groups, self.out_channels // self.groups, -1)  # B, groups, c_out // groups, c_in // groups * k * k
 
         unfold = nn.functional.unfold(
@@ -120,9 +129,8 @@ class ODConv2d(nn.Conv2d):
         output = weight @ unfold  # B, groups, c_out // groups, H_out * W_out
         output = output.view(B, self.out_channels, *output_size)  # B, c_out, H_out * W_out
 
-        if self.bias is not None:
-            bias = attn_w @ self.bias  # B, c_out
-            output = output + bias[:, :, None, None]
+        if bias is not None:
+            output = output + bias.view(B, self.out_channels, 1, 1)
 
         return output
 
